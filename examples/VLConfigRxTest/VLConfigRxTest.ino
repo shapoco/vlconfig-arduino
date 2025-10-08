@@ -9,15 +9,18 @@
 
 const char *KEY_TEXT = "t";
 const char *KEY_PASS = "p";
+const char *KEY_NUMBER = "n";
 const char *KEY_IP_ADDR = "i";
 const char *KEY_LED_ON = "l";
 char textBuff[32 + 1];
 char passBuff[32 + 1];
+int32_t numberBuff;
 uint8_t ipBuff[6];
 uint8_t ledOnBuff;
 VlcfgEntry configEntries[] = {
   { KEY_TEXT, textBuff, VlcfgType::TEXT_STR, sizeof(textBuff), 0 },
   { KEY_PASS, passBuff, VlcfgType::TEXT_STR, sizeof(passBuff), 0 },
+  { KEY_NUMBER, &numberBuff, VlcfgType::INT, sizeof(numberBuff), 0 },
   { KEY_IP_ADDR, ipBuff, VlcfgType::BYTE_STR, sizeof(ipBuff), 0 },
   { KEY_LED_ON, &ledOnBuff, VlcfgType::BOOLEAN, sizeof(ledOnBuff), 0 },
   { nullptr, nullptr, vlcfg::ValueType::NONE, 0, 0 },  // terminator
@@ -84,6 +87,14 @@ void onReceived() {
     Serial.print("'");
     Serial.print(passBuff);
     Serial.println("'");
+  } else {
+    Serial.println("(none)");
+  }
+
+  e = receiver.entry_from_key(KEY_NUMBER);
+  Serial.print("Number: ");
+  if (e->was_received()) {
+    Serial.println(numberBuff);
   } else {
     Serial.println("(none)");
   }
