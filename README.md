@@ -4,11 +4,13 @@
 
 See [VLConfig](https://github.com/shapoco/vlconfig).
 
-## Example
-
-### Connection
+## Demo
 
 ![](./img/arduino_conn_with_adc.svg)
+
+### Demo Page
+
+See [Demo Page](https://shapoco.github.io/vlconfig/demo/).
 
 ### Sketch
 

@@ -51,8 +51,8 @@ int vlcfg_printf(const char* fmt, ...) {
 }
 #endif
 
-#define VLCFG_PRINTF(fmt, ...)                          \
-  do {                                                  \
+#define VLCFG_PRINTF(fmt, ...)                                \
+  do {                                                        \
     vlcfg_printf("[VLCFG:%d] " fmt, __LINE__, ##__VA_ARGS__); \
   } while (0)
 
@@ -162,11 +162,12 @@ enum class ValueType : int8_t {
   MAP = 5,
   // TAG = 6,
   // SIMPLE_FLOAT = 7,
-  INVALID = -1,
+  BOOLEAN = 8,
+  NONE = -1,
 };
 
 enum ConfigEntryFlags : uint8_t {
-  RECEIVED = 0x01,
+  ENTRY_RECEIVED = 0x01,
 };
 
 struct ConfigEntry {
@@ -176,9 +177,13 @@ struct ConfigEntry {
   uint8_t capacity;
   uint8_t received;
   uint8_t flags;
+
+  inline bool was_received() const { return (flags & ENTRY_RECEIVED) != 0; }
 };
 
 const char* result_to_string(Result res);
+int16_t find_key(const ConfigEntry* entries, const char* key);
+ConfigEntry* entry_from_key(ConfigEntry* entries, const char* key);
 uint32_t crc32(const uint8_t* data, uint16_t length);
 uint16_t median3(uint16_t a, uint16_t b, uint16_t c);
 
@@ -204,6 +209,29 @@ const char* result_to_string(Result res) {
     case Result::ERR_BAD_CRC: return "ERR_BAD_CRC";
     default: return "(Unknown Error)";
   }
+}
+
+int16_t find_key(const ConfigEntry* entries, const char* key) {
+  if (entries == nullptr || key == nullptr) return -1;
+
+  int16_t entry_index = -1;
+  for (uint8_t i = 0; i < MAX_ENTRY_COUNT; i++) {
+    const ConfigEntry& entry = entries[i];
+    if (entry.key == nullptr) {
+      return -1;
+    }
+    for (uint8_t j = 0; j < MAX_KEY_LEN + 1; j++) {
+      if (entry.key[j] != key[j]) break;
+      if (key[j] == '\0') return i;
+    }
+  }
+  return -1;
+}
+
+ConfigEntry* entry_from_key(ConfigEntry* entries, const char* key) {
+  int16_t index = find_key(entries, key);
+  if (index < 0) return nullptr;
+  return &entries[index];
 }
 
 uint32_t crc32(const uint8_t* data, uint16_t length) {
@@ -522,15 +550,6 @@ class RxBuff {
     return Result::SUCCESS;
   }
 
-  inline bool readIfMatch(const uint8_t *pattern, uint16_t len) {
-    if (size() < len) return false;
-    for (uint16_t i = 0; i < len; i++) {
-      if (peek(i) != pattern[i]) return false;
-    }
-    read_pos += len;
-    return true;
-  }
-
   inline Result popU8(uint8_t *out) { return popBytes(out, 1); }
   inline Result popU16(uint16_t *out) {
     uint8_t buf[2];
@@ -547,35 +566,45 @@ class RxBuff {
     return Result::SUCCESS;
   }
 
-  Result read_item_header_u32(ValueType *major_type, uint32_t *param);
+  Result read_item_header_u32(ValueType *value_type, uint32_t *param);
   Result check_and_remove_crc();
 };
 
 #ifdef VLCFG_IMPLEMENTATION
 
-Result RxBuff::read_item_header_u32(ValueType *major_type, uint32_t *param) {
+Result RxBuff::read_item_header_u32(ValueType *value_type, uint32_t *param) {
   uint8_t ib;
   VLCFG_TRY(popU8(&ib));
 
-  *major_type = static_cast<ValueType>(ib >> 5);
-
+  uint8_t mt = ib >> 5;
   uint8_t short_count = (ib & 0x1f);
-  if (short_count <= 23) {
-    *param = short_count;
-  } else if (short_count == 24) {
-    uint8_t tmp;
-    VLCFG_TRY(popU8(&tmp));
-    *param = tmp;
-  } else if (short_count == 25) {
-    uint16_t tmp;
-    VLCFG_TRY(popU16(&tmp));
-    *param = tmp;
-  } else if (short_count == 26) {
-    uint32_t tmp;
-    VLCFG_TRY(popU32(&tmp));
-    *param = tmp;
+
+  if (mt < 7) {
+    *value_type = static_cast<ValueType>(mt);
+
+    if (short_count <= 23) {
+      *param = short_count;
+    } else if (short_count == 24) {
+      uint8_t tmp;
+      VLCFG_TRY(popU8(&tmp));
+      *param = tmp;
+    } else if (short_count == 25) {
+      uint16_t tmp;
+      VLCFG_TRY(popU16(&tmp));
+      *param = tmp;
+    } else if (short_count == 26) {
+      uint32_t tmp;
+      VLCFG_TRY(popU32(&tmp));
+      *param = tmp;
+    } else {
+      VLCFG_THROW(Result::ERR_BAD_SHORT_COUNT);
+    }
+  } else if (short_count == 20 || short_count == 21) {
+    *value_type = ValueType::BOOLEAN;
+    *param = short_count - 20;
+    return Result::SUCCESS;
   } else {
-    VLCFG_THROW(Result::ERR_BAD_SHORT_COUNT);
+    VLCFG_THROW(Result::ERR_UNSUPPORTED_TYPE);
   }
 
   return Result::SUCCESS;
@@ -617,32 +646,37 @@ class RxDecoder {
   RxBuff buff;
 
   ConfigEntry* entries = nullptr;
-  uint8_t num_entries = 0;
   RxState state = RxState::IDLE;
 
  public:
   inline RxDecoder(int capacity) : buff(capacity) { buff.init(); }
 
-  void init(ConfigEntry* dst, uint8_t num_entries);
+  void init(ConfigEntry* dst);
   Result update(PcsOutput* in, RxState* rx_state);
+  inline RxState get_state() const { return state; }
+  inline ConfigEntry* entry_from_key(const char* key) const {
+    return vlcfg::entry_from_key(entries, key);
+  }
 
  private:
   Result update_state(PcsOutput* in);
   Result rx_complete();
-  Result find_key(int16_t* entry_index);
+  Result read_key(int16_t* entry_index);
   Result read_value(ConfigEntry* entry);
 };
 
 #ifdef VLCFG_IMPLEMENTATION
 
-void RxDecoder::init(ConfigEntry* entries, uint8_t num_entries) {
+void RxDecoder::init(ConfigEntry* entries) {
   this->buff.init();
   this->entries = entries;
-  this->num_entries = num_entries;
-  for (uint8_t i = 0; i < num_entries; i++) {
-    ConfigEntry& entry = entries[i];
-    entry.flags &= ~ConfigEntryFlags::RECEIVED;
-    entry.received = 0;
+  if (entries) {
+    for (uint8_t i = 0; i < MAX_ENTRY_COUNT; i++) {
+      ConfigEntry& entry = entries[i];
+      if (entry.key == nullptr) break;
+      entry.flags &= ~ConfigEntryFlags::ENTRY_RECEIVED;
+      entry.received = 0;
+    }
   }
   this->state = RxState::IDLE;
   VLCFG_PRINTF("RX Decoder initialized.\n");
@@ -718,7 +752,7 @@ Result RxDecoder::rx_complete() {
   for (uint8_t i = 0; i < num_entries; i++) {
     // match key
     int16_t entry_index = -1;
-    VLCFG_TRY(find_key(&entry_index));
+    VLCFG_TRY(read_key(&entry_index));
     if (entry_index < 0) {
       VLCFG_THROW(Result::ERR_KEY_NOT_FOUND);
     }
@@ -737,7 +771,7 @@ Result RxDecoder::rx_complete() {
   return Result::SUCCESS;
 }
 
-Result RxDecoder::find_key(int16_t* entry_index) {
+Result RxDecoder::read_key(int16_t* entry_index) {
   // read key
   ValueType mtype;
   uint32_t param;
@@ -754,21 +788,7 @@ Result RxDecoder::find_key(int16_t* entry_index) {
   rx_key[rx_key_len] = '\0';
   VLCFG_PRINTF("key: '%s'\n", rx_key);
 
-  *entry_index = -1;
-  for (uint8_t i = 0; i < num_entries; i++) {
-    ConfigEntry& entry = entries[i];
-    if (entry.key == nullptr) {
-      VLCFG_THROW(Result::ERR_NULL_POINTER);
-    }
-    for (uint8_t j = 0; j < MAX_KEY_LEN + 1; j++) {
-      if (entry.key[j] != rx_key[j]) break;
-      if (rx_key[j] == '\0') {
-        *entry_index = i;
-        break;
-      }
-    }
-    if (*entry_index >= 0) break;
-  }
+  *entry_index = find_key(entries, rx_key);
 
   VLCFG_PRINTF("--> field_index=%d\n", *entry_index);
   return Result::SUCCESS;
@@ -810,10 +830,21 @@ Result RxDecoder::read_value(ConfigEntry* entry) {
       }
     } break;
 
+    case ValueType::BOOLEAN: {
+      len = 1;
+      if (entry != nullptr) {
+        if (entry->capacity < 1) {
+          VLCFG_THROW(Result::ERR_VALUE_TOO_LONG);
+        }
+        *((uint8_t*)entry->buffer) = param;
+        VLCFG_PRINTF("boolean value: %s\n", param ? "true" : "false");
+      }
+    } break;
+
     default: VLCFG_THROW(Result::ERR_VALUE_TYPE_MISMATCH);
   }
 
-  entry->flags |= ConfigEntryFlags::RECEIVED;
+  entry->flags |= ConfigEntryFlags::ENTRY_RECEIVED;
   entry->received = len;
   return Result::SUCCESS;
 }
@@ -1019,32 +1050,39 @@ class Receiver {
  public:
   RxCdr cdr;
   RxPcs pcs;
-  RxDecoder dec;
+  RxDecoder decoder;
 
  private:
   bool last_bit;
   uint8_t last_byte;
 
  public:
-  inline Receiver(int rx_buff_size = 256, ConfigEntry *entries = nullptr,
-                  uint8_t num_entries = 0)
-      : dec(rx_buff_size) {
-    init(entries, num_entries);
+  inline Receiver(int rx_buff_size = 256, ConfigEntry *entries = nullptr)
+      : decoder(rx_buff_size) {
+    init(entries);
   }
-  void init(ConfigEntry *entries, uint8_t num_entries);
+
+  void init(ConfigEntry *entries);
   Result update(uint16_t adc_val, RxState *rx_state);
+
   inline bool signal_detected() const { return cdr.signal_detected(); }
   inline PcsState get_pcs_state() const { return pcs.get_state(); }
+  inline RxState get_decoder_state() const { return decoder.get_state(); }
+
   inline bool get_last_bit() const { return last_bit; }
   inline uint8_t get_last_byte() const { return last_byte; }
+
+  inline ConfigEntry *entry_from_key(const char *key) const {
+    return decoder.entry_from_key(key);
+  }
 };  // class
 
 #ifdef VLCFG_IMPLEMENTATION
 
-void Receiver::init(ConfigEntry *entries, uint8_t num_entries) {
+void Receiver::init(ConfigEntry *entries) {
   cdr.init();
   pcs.init();
-  dec.init(entries, num_entries);
+  decoder.init(entries);
   VLCFG_PRINTF("Receiver initialized.\n");
 }
 
@@ -1057,7 +1095,7 @@ Result Receiver::update(uint16_t adc_val, RxState *rx_state) {
   VLCFG_TRY(pcs.update(&cdrOut, &pcsOut));
   if (pcsOut.rxed) last_byte = pcsOut.rx_byte;
 
-  VLCFG_TRY(dec.update(&pcsOut, rx_state));
+  VLCFG_TRY(decoder.update(&pcsOut, rx_state));
 
   return Result::SUCCESS;
 }
