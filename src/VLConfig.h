@@ -107,11 +107,12 @@ static constexpr uint32_t RX_SAMPLE_PERIOD_US =
 static constexpr uint8_t MAX_ENTRY_COUNT = 32;
 static constexpr uint8_t MAX_KEY_LEN = 16;
 
-static constexpr int16_t SYMBOL_CONTROL = -1;
-static constexpr int16_t SYMBOL_SYNC = -2;
-static constexpr int16_t SYMBOL_SOF = -3;
-static constexpr int16_t SYMBOL_EOF = -4;
-static constexpr int16_t SYMBOL_INVALID = -16;
+static constexpr int8_t SYMBOL_CTRL = -1;
+static constexpr int8_t SYMBOL_SYNC = -2;
+static constexpr int8_t SYMBOL_SOF = -3;
+static constexpr int8_t SYMBOL_EOF = -4;
+static constexpr int8_t SYMBOL_NONE = -16;
+static constexpr int8_t SYMBOL_INVALID = -17;
 
 enum class PcsState : uint8_t {
   LOS,
@@ -184,8 +185,8 @@ struct ConfigEntry {
   void* buffer;
   ValueType type;
   uint8_t capacity;
-  uint8_t received;
-  uint8_t flags;
+  uint8_t flags = 0;
+  uint8_t received = 0;
 
   inline bool was_received() const { return (flags & ENTRY_RECEIVED) != 0; }
 };
@@ -520,7 +521,8 @@ class RxBuff {
     read_pos = 0;
   }
 
-  inline uint16_t size() const { return write_pos - read_pos; }
+  inline uint16_t queued_size() const { return write_pos - read_pos; }
+  inline uint16_t stored_size() const { return write_pos; }
 
   inline const uint8_t &operator[](uint16_t index) const { return buff[index]; }
 
@@ -540,7 +542,7 @@ class RxBuff {
   }
 
   inline Result popBytes(uint8_t *out, uint16_t len) {
-    if (size() < len) {
+    if (queued_size() < len) {
       VLCFG_THROW(Result::ERR_UNEXPECTED_EOF);
     }
     if (out == nullptr) {
@@ -553,7 +555,7 @@ class RxBuff {
   }
 
   inline Result skip(uint16_t len) {
-    if (size() < len) {
+    if (queued_size() < len) {
       VLCFG_THROW(Result::ERR_UNEXPECTED_EOF);
     }
     read_pos += len;
@@ -681,6 +683,7 @@ class RxDecoder {
   inline ConfigEntry* entry_from_key(const char* key) const {
     return vlcfg::entry_from_key(entries, key);
   }
+  inline uint16_t get_received_size() const { return buff.stored_size(); }
 
  private:
   Result update_state(PcsOutput* in);
@@ -747,7 +750,7 @@ Result RxDecoder::update_state(PcsOutput* in) {
 }
 
 Result RxDecoder::rx_complete() {
-  VLCFG_PRINTF("%d bytes received.\n", (int)buff.size());
+  VLCFG_PRINTF("%d bytes received.\n", (int)buff.queued_size());
   // #ifdef VLCFG_DEBUG
   //   VLCFG_PRINTF("buffer content:\n");
   //   for (uint16_t i = 0; i < buff.size(); i++) {
@@ -784,7 +787,7 @@ Result RxDecoder::rx_complete() {
     VLCFG_TRY(read_value(&entry));
   }
 
-  if (buff.size() != 0) {
+  if (buff.queued_size() != 0) {
     VLCFG_THROW(Result::ERR_EXTRA_BYTES);
   }
 
@@ -953,6 +956,10 @@ class RxPcs {
   uint8_t phase;
 
  public:
+#ifdef VLCFG_DEBUG
+  int8_t dbg_rxed_symbol;
+#endif
+
   inline RxPcs() { init(); }
   void init();
   Result update(const CdrOutput *in, PcsOutput *out);
@@ -975,7 +982,7 @@ static const int8_t DECODE_TABLE[1 << SYMBOL_BITS] = {
     SYMBOL_EOF,      // 0b00111
     SYMBOL_INVALID,  // 0b01000
     0x2,             // 0b01001
-    SYMBOL_CONTROL,  // 0b01010
+    SYMBOL_CTRL,     // 0b01010
     0x3,             // 0b01011
     0x4,             // 0b01100
     0x5,             // 0b01101
@@ -1005,6 +1012,10 @@ void RxPcs::init() {
 }
 
 Result RxPcs::update(const CdrOutput *in, PcsOutput *out) {
+#ifdef VLCFG_DEBUG
+  dbg_rxed_symbol = SYMBOL_NONE;
+#endif
+
   if (out == nullptr) {
     VLCFG_THROW(Result::ERR_NULL_POINTER);
   }
@@ -1029,11 +1040,17 @@ Result RxPcs::update(const CdrOutput *in, PcsOutput *out) {
   int8_t nibble_h = DECODE_TABLE[(shift_reg >> SYMBOL_BITS) & SYMBOL_MASK];
   int8_t nibble_l = DECODE_TABLE[shift_reg & SYMBOL_MASK];
   bool rxed_sync = false, rxed_sof = false, rxed_eof = false;
-  if (nibble_h == SYMBOL_CONTROL) {
+  if (nibble_h == SYMBOL_CTRL) {
     rxed_sync = (nibble_l == SYMBOL_SYNC);
     rxed_sof = (nibble_l == SYMBOL_SOF);
     rxed_eof = (nibble_l == SYMBOL_EOF);
   }
+
+#ifdef VLCFG_DEBUG
+  if ((state == PcsState::LOS) || (phase == SYMBOL_BITS - 1) || (phase == SYMBOL_BITS * 2 - 1)) {
+    dbg_rxed_symbol = nibble_l;
+  }
+#endif
 
   bool rxed = false;
   PcsState last_state = state;
@@ -1118,6 +1135,9 @@ void RxPcs::reset_internal() {
   state = PcsState::LOS;
   phase = 0;
   shift_reg = 0;
+#ifdef VLCFG_DEBUG
+  dbg_rxed_symbol = SYMBOL_NONE;
+#endif
 }
 
 #endif
